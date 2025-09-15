@@ -1,0 +1,109 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# master-init.sh
+#
+# A fully automated script to initialize a Kubernetes control-plane node AND
+# install Calico CNI.
+#
+# -----------------------------------------------------------------------------
+
+# Run install k8s dependecy script.
+/bin/bash /tmp/install-k8s-deps.sh
+
+# Exit immediately if a command exits with a non-zero status.
+set -e
+
+# --- Configuration ---
+CALICO_VERSION="v3.29.1"
+
+# --- Step 1: Detect Primary IP Address ---
+echo "--- Step 1: Detecting primary IP address ---"
+local_ip=$(hostname -I | awk '{print $1}')
+
+if [ -z "$local_ip" ]; then
+    echo "Error: Could not determine the node's IP addresses. Exiting"
+    exit 1
+fi
+
+echo "Found IP: $local_ip"
+
+# --- Step 2: Create a Kubeadm Configuration ---
+echo "--- Step 2: Creating minimal kubeadm configuration file ---"
+
+cat <<EOF | sudo tee /etc/kubernetes/kubeadm.config
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: "$local_ip"
+nodeRegistration:
+  kubeletExtraArgs:
+    node-ip: "$local_ip"
+---
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: ClusterConfiguration
+networking:
+  # The podSubnet is required for the CNI plugin (e.g., Flannel, Calico) to work.
+  podSubnet: "10.244.0.0/16"
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+# This cgroupDriver MUST match your container runtime's driver (CRI-O uses "systemd").
+cgroupDriver: "systemd"
+EOF
+
+# --- Step 3: Initialize the Kubernetes Cluster ---
+echo "--- Step 3: Initializing Kubernetes cluster with kubeadm ---"
+sudo kubeadm init --config=/etc/kubernetes/kubeadm.config
+
+# --- Step 4: Configure kubectl for the Current User ---
+echo "--- Step 4: Configuring kubectl for the current user ---"
+mkdir -p $HOME/.kube
+sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+# --- Step 5: Install the Tigera Calico Operator ---
+echo "--- Step 5: Installing the Tigera Calico Operator ---"
+kubectl create -f "https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/tigera-operator.yaml"
+
+# --- Step 6: Wait for the Operator to be ready ---
+echo "--- Step 6: Waiting for the Tigera Operator to be available ---"
+kubectl wait --namespace tigera-operator --for=condition=available deployment/tigera-operator --timeout=120s
+
+# --- Step 7: Discover the Pod CIDR ---
+echo "--- Step 7: Discovering the cluster's Pod CIDR ---"
+pod_cidr=$(kubectl -n kube-system get pod -l component=kube-controller-manager -o yaml | awk -F'=' '/cluster-cidr/ {print $2}')
+
+if [ -z "$pod_cidr" ]; then
+    echo "Error: Could not automatically discover the pod CIDR. Aborting."
+    exit 1
+fi
+echo "Found Pod CIDR: $pod_cidr"
+
+cat <<EOF | kubectl apply -f -
+apiVersion: operator.tigera.io/v1
+kind: Installation
+metadata:
+  name: default
+spec:
+  # Configure Calico networking.
+  calicoNetwork:
+    # Use the discovered pod CIDR.
+    ipPools:
+    - blockSize: 26
+      cidr: $pod_cidr
+      encapsulation: VXLANCrossSubnet
+      natOutgoing: Enabled
+      nodeSelector: all()
+EOF
+
+# --- Step 8: Final Verification and Success Message ---
+echo ""
+echo "✅✅✅ Master Node Initialization and Calico CNI installation complete! ✅✅✅"
+echo ""
+echo "It may take a few minutes for all the system pods to become ready."
+echo "Monitor the progress with the following command:"
+echo "  watch kubectl get pods --all-namespaces"
+echo ""
+echo "Your cluster join command for worker nodes was printed by 'kubeadm init' earlier."
+echo "If you need to see it again, run: sudo kubeadm token create --print-join-command"
+echo ""
