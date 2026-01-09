@@ -61,15 +61,18 @@ mkdir -p $HOME/.kube
 sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
 sudo chown $(id -u):$(id -g) $HOME/.kube/config
 
-# --- Step 5: Install the Tigera Calico Operator ---
+# --- Step 5: Install Metric Server ---
+kubectl apply -f https://raw.githubusercontent.com/techiescamp/cka-certification-guide/refs/heads/main/lab-setup/manifests/metrics-server/metrics-server.yaml
+
+# --- Step 6: Install the Tigera Calico Operator ---
 echo "--- Step 5: Installing the Tigera Calico Operator ---"
 kubectl create -f "https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/tigera-operator.yaml"
 
-# --- Step 6: Wait for the Operator to be ready ---
+# --- Step 7: Wait for the Operator to be ready ---
 echo "--- Step 6: Waiting for the Tigera Operator to be available ---"
 kubectl wait --namespace tigera-operator --for=condition=available deployment/tigera-operator --timeout=120s
 
-# --- Step 7: Discover the Pod CIDR ---
+# --- Step 8: Discover the Pod CIDR ---
 echo "--- Step 7: Discovering the cluster's Pod CIDR ---"
 pod_cidr=$(kubectl -n kube-system get pod -l component=kube-controller-manager -o yaml | awk -F'=' '/cluster-cidr/ {print $2}')
 
@@ -96,7 +99,7 @@ spec:
       nodeSelector: all()
 EOF
 
-# --- Step 8: Final Verification and Success Message ---
+# --- Step 9: Final Verification and Success Message ---
 echo ""
 echo "✅✅✅ Master Node Initialization and Calico CNI installation complete! ✅✅✅"
 echo ""
