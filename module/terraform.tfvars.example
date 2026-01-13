@@ -1,0 +1,29 @@
+# -----------------------------------------------------------------------------
+# EXAMPLE TERRAFORM VARIABLES
+# Copy this file to terraform.tfvars and customize for your environment
+# -----------------------------------------------------------------------------
+
+# GCP Configuration
+gcp_project_id = "your-project-id"
+gcp_region     = "asia-southeast2"
+gcp_zone       = "asia-southeast2-a"
+
+# Cluster Configuration
+cluster_name = "k8s"
+worker_count = 2
+
+# Compute Configuration
+instance_type      = "e2-medium"
+boot_disk_size     = 30
+boot_disk_image    = "ubuntu-os-cloud/ubuntu-2204-lts"
+use_spot_instances = true
+
+# Network Configuration
+subnet_cidr = "10.10.1.0/24"
+my_ip       = "0.0.0.0/0"  # Change to "YOUR_IP/32" for production
+
+# SSH Configuration
+ssh_user             = "ubuntu"
+ssh_public_key_path  = "~/.ssh/id_rsa.pub"
+ssh_private_key_path = "~/.ssh/id_rsa"
+
