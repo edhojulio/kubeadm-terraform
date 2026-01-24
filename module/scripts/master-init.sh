@@ -5,6 +5,7 @@
 # A fully automated script to initialize a Kubernetes control-plane node AND
 # install Calico CNI.
 #
+# Usage: sudo ./master-init.sh <ssh_user>
 # -----------------------------------------------------------------------------
 
 # Run install k8s dependecy script.
@@ -15,6 +16,11 @@ set -e
 
 # --- Configuration ---
 CALICO_VERSION="v3.29.1"
+NON_ROOT_USER="${1:-}"
+
+if [ -z "$NON_ROOT_USER" ]; then
+    echo "Warning: No SSH user provided. kubectl will only be configured for root."
+fi
 
 # --- Step 1: Detect Primary IP Address ---
 echo "--- Step 1: Detecting primary IP address ---"
@@ -55,25 +61,34 @@ EOF
 echo "--- Step 3: Initializing Kubernetes cluster with kubeadm ---"
 sudo kubeadm init --config=/etc/kubernetes/kubeadm.config
 
-# --- Step 4: Configure kubectl for the Current User ---
-echo "--- Step 4: Configuring kubectl for the current user ---"
-mkdir -p $HOME/.kube
-sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
-sudo chown $(id -u):$(id -g) $HOME/.kube/config
+# --- Step 4: Configure kubectl for root (needed for subsequent commands) ---
+echo "--- Step 4: Configuring kubectl for root user ---"
+mkdir -p /root/.kube
+cp /etc/kubernetes/admin.conf /root/.kube/config
 
-# --- Step 5: Install Metric Server ---
+# --- Step 5: Configure kubectl for the non-root user ---
+if [ -n "$NON_ROOT_USER" ] && id "$NON_ROOT_USER" &>/dev/null; then
+    echo "--- Step 5: Configuring kubectl for user '$NON_ROOT_USER' ---"
+    USER_HOME=$(getent passwd "$NON_ROOT_USER" | cut -d: -f6)
+    mkdir -p "$USER_HOME/.kube"
+    cp /etc/kubernetes/admin.conf "$USER_HOME/.kube/config"
+    chown -R $(id -u "$NON_ROOT_USER"):$(id -g "$NON_ROOT_USER") "$USER_HOME/.kube"
+fi
+
+# --- Step 6: Install Metric Server ---
+echo "--- Step 6: Installing Metrics Server ---"
 kubectl apply -f https://raw.githubusercontent.com/techiescamp/cka-certification-guide/refs/heads/main/lab-setup/manifests/metrics-server/metrics-server.yaml
 
-# --- Step 6: Install the Tigera Calico Operator ---
-echo "--- Step 5: Installing the Tigera Calico Operator ---"
+# --- Step 7: Install the Tigera Calico Operator ---
+echo "--- Step 7: Installing the Tigera Calico Operator ---"
 kubectl create -f "https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/tigera-operator.yaml"
 
-# --- Step 7: Wait for the Operator to be ready ---
-echo "--- Step 6: Waiting for the Tigera Operator to be available ---"
+# --- Step 8: Wait for the Operator to be ready ---
+echo "--- Step 8: Waiting for the Tigera Operator to be available ---"
 kubectl wait --namespace tigera-operator --for=condition=available deployment/tigera-operator --timeout=120s
 
-# --- Step 8: Discover the Pod CIDR ---
-echo "--- Step 7: Discovering the cluster's Pod CIDR ---"
+# --- Step 9: Discover the Pod CIDR ---
+echo "--- Step 9: Discovering the cluster's Pod CIDR ---"
 pod_cidr=$(kubectl -n kube-system get pod -l component=kube-controller-manager -o yaml | awk -F'=' '/cluster-cidr/ {print $2}')
 
 if [ -z "$pod_cidr" ]; then
@@ -99,7 +114,7 @@ spec:
       nodeSelector: all()
 EOF
 
-# --- Step 9: Final Verification and Success Message ---
+# --- Step 10: Final Verification and Success Message ---
 echo ""
 echo "✅✅✅ Master Node Initialization and Calico CNI installation complete! ✅✅✅"
 echo ""
