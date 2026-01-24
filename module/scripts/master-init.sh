@@ -8,11 +8,11 @@
 # Usage: sudo ./master-init.sh <ssh_user>
 # -----------------------------------------------------------------------------
 
-# Run install k8s dependecy script.
-/bin/bash /tmp/install-k8s-deps.sh
-
 # Exit immediately if a command exits with a non-zero status.
 set -e
+
+# Run install k8s dependency script.
+/bin/bash /tmp/install-k8s-deps.sh
 
 # --- Configuration ---
 CALICO_VERSION="v3.29.1"
@@ -35,6 +35,7 @@ echo "Found IP: $local_ip"
 
 # --- Step 2: Create a Kubeadm Configuration ---
 echo "--- Step 2: Creating minimal kubeadm configuration file ---"
+sudo mkdir -p /etc/kubernetes
 
 cat <<EOF | sudo tee /etc/kubernetes/kubeadm.config
 apiVersion: kubeadm.k8s.io/v1beta3
