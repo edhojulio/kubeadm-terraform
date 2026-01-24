@@ -165,7 +165,7 @@ resource "google_compute_instance" "k8s_master" {
     inline = [
       "sudo chmod +x /tmp/install-k8s-deps.sh",
       "sudo chmod +x /tmp/master-init.sh",
-      "sudo /tmp/master-init.sh"
+      "sudo /tmp/master-init.sh ${var.ssh_user}"
     ]
   }
 
