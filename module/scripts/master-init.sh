@@ -5,7 +5,7 @@
 # A fully automated script to initialize a Kubernetes control-plane node AND
 # install Calico CNI.
 #
-# Usage: sudo ./master-init.sh <ssh_user>
+# Usage: sudo ./master-init.sh <ssh_user> [public_ip]
 # -----------------------------------------------------------------------------
 
 # Exit immediately if a command exits with a non-zero status.
@@ -17,6 +17,7 @@ set -e
 # --- Configuration ---
 CALICO_VERSION="v3.29.1"
 NON_ROOT_USER="${1:-}"
+PUBLIC_IP="${2:-}"
 
 if [ -z "$NON_ROOT_USER" ]; then
     echo "Warning: No SSH user provided. kubectl will only be configured for root."
@@ -37,6 +38,17 @@ echo "Found IP: $local_ip"
 echo "--- Step 2: Creating minimal kubeadm configuration file ---"
 sudo mkdir -p /etc/kubernetes
 
+CERT_SANS_BLOCK=""
+if [ -n "$PUBLIC_IP" ]; then
+    CERT_SANS_BLOCK=$(cat <<SANS
+apiServer:
+  certSANs:
+    - "$PUBLIC_IP"
+    - "$local_ip"
+SANS
+    )
+fi
+
 cat <<EOF | sudo tee /etc/kubernetes/kubeadm.config
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: InitConfiguration
@@ -48,13 +60,12 @@ nodeRegistration:
 ---
 apiVersion: kubeadm.k8s.io/v1beta3
 kind: ClusterConfiguration
+${CERT_SANS_BLOCK}
 networking:
-  # The podSubnet is required for the CNI plugin (e.g., Flannel, Calico) to work.
   podSubnet: "10.244.0.0/16"
 ---
 apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
-# This cgroupDriver MUST match your container runtime's driver (CRI-O uses "systemd").
 cgroupDriver: "systemd"
 EOF
 
