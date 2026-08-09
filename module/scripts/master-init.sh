@@ -126,9 +126,25 @@ spec:
       nodeSelector: all()
 EOF
 
-# --- Step 10: Final Verification and Success Message ---
+# --- Step 10: Wait for Calico to be ready enough to schedule workloads ---
+echo "--- Step 10: Waiting for Calico / core networking ---"
+# Give the operator time to create calico-system resources.
+sleep 15
+kubectl wait --for=condition=Ready pods --all -n calico-system --timeout=300s || \
+  echo "Warning: Calico pods not fully Ready yet; continuing with ingress install."
+
+# --- Step 11: Install ingress-nginx (HTTP/HTTPS front door) ---
+echo "--- Step 11: Installing ingress-nginx ---"
+if [ -f /tmp/install-ingress.sh ]; then
+    chmod +x /tmp/install-ingress.sh
+    /bin/bash /tmp/install-ingress.sh
+else
+    echo "Warning: /tmp/install-ingress.sh not found; skip ingress install."
+fi
+
+# --- Step 12: Final Verification and Success Message ---
 echo ""
-echo "✅✅✅ Master Node Initialization and Calico CNI installation complete! ✅✅✅"
+echo "✅✅✅ Master Node Initialization complete (Calico + ingress-nginx)! ✅✅✅"
 echo ""
 echo "It may take a few minutes for all the system pods to become ready."
 echo "Monitor the progress with the following command:"
@@ -136,4 +152,7 @@ echo "  watch kubectl get pods --all-namespaces"
 echo ""
 echo "Your cluster join command for worker nodes was printed by 'kubeadm init' earlier."
 echo "If you need to see it again, run: sudo kubeadm token create --print-join-command"
+echo ""
+echo "Expose apps with Ingress (ingressClassName: nginx) + ClusterIP Services."
+echo "Public entry is worker :80/:443 — not NodePort."
 echo ""

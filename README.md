@@ -2,21 +2,24 @@
 
 Provision a small Kubernetes cluster on GCP with Terraform + kubeadm.
 
-This lab spins up a control-plane (master) and optional worker VMs, installs CRI-O / kubeadm / kubelet, initializes the cluster, and installs Calico plus Metrics Server.
+This lab spins up a jumpbox (bastion), a control-plane (master), and optional worker VMs. It installs CRI-O / kubeadm / kubelet, initializes the cluster, and installs Calico, Metrics Server, and ingress-nginx (HTTP/HTTPS front door).
 
 ## Layout
 
 ```text
 .
 ├── module/                     # Reusable Terraform module
-│   ├── main.tf                 # VPC, firewall, master + workers
+│   ├── main.tf                 # VPC, firewall, jumpbox, master + workers
 │   ├── variables.tf
 │   ├── outputs.tf
 │   ├── provider.tf
 │   ├── terraform.tfvars.example
 │   └── scripts/
 │       ├── install-k8s-deps.sh # OS prep + CRI-O + kube packages
-│       └── master-init.sh      # kubeadm init, Calico, Metrics Server
+│       ├── master-init.sh      # kubeadm init, Calico, Metrics Server, ingress
+│       └── install-ingress.sh  # ingress-nginx + hostNetwork :80/:443
+├── examples/
+│   └── hello-secure/           # ClusterIP + Ingress + NetworkPolicies sample
 └── environment/
     └── staging/                # Example environment that calls the module
 ```
@@ -26,12 +29,29 @@ This lab spins up a control-plane (master) and optional worker VMs, installs CRI
 | Resource | Details |
 |---|---|
 | VPC + subnet | Custom network, default `10.10.1.0/24` |
-| Static IP | Reserved public IP for the master |
-| Master VM | kubeadm init, Calico CNI, Metrics Server |
+| Jumpbox | Small on-demand bastion with public IP (admin entry) |
+| Static IPs | Jumpbox + master |
+| Master VM | kubeadm init, Calico CNI, Metrics Server, ingress-nginx |
 | Worker VMs | deps installed; join manually |
-| Firewall | SSH (from `my_ip`), internal all, API `6443`, NodePort `30000-32767` |
+| Firewall | SSH to jumpbox from `my_ip`; SSH/API private (VPC); HTTP/HTTPS on workers |
 
-Defaults use **spot/preemptible** `e2-medium` Ubuntu 22.04 nodes (cheap for labs; can be reclaimed by GCP).
+Defaults use **spot/preemptible** `e2-medium` Ubuntu 22.04 for master/workers. The jumpbox is always **on-demand** (`e2-micro` by default).
+
+## Secure access flow
+
+```text
+Laptop ──SSH──► jumpbox (public :22, my_ip only)
+                  │
+                  ├──SSH──► master / workers (private IPs)
+                  └──kubectl──► API :6443 (VPC only)
+
+Internet ──:80/:443──► worker (ingress-nginx hostNetwork)
+                         └──► ClusterIP Service ──► Pods
+```
+
+- Admin path: laptop → jumpbox → cluster (no public SSH/API on nodes).
+- App path: public HTTP/HTTPS on workers only.
+- Do **not** expose apps with public NodePort.
 
 ## Prerequisites
 
@@ -52,7 +72,7 @@ cd environment/staging
 
 # Create local vars (gitignored)
 cp ../../module/terraform.tfvars.example terraform.tfvars
-# Edit: gcp_project_id, my_ip, ssh_user, key paths, worker_count, etc.
+# Edit: gcp_project_id, my_ip (YOUR_IP/32), ssh_user, key paths, worker_count, etc.
 
 terraform init
 terraform plan
@@ -62,36 +82,75 @@ terraform apply
 Useful outputs after apply:
 
 ```bash
+terraform output ssh_command_jumpbox
 terraform output ssh_command_master
-terraform output master_public_ip
+terraform output kubectl_tunnel_command
+terraform output worker_public_ips
 terraform output kubeadm_join_command
 ```
-
-## Join workers
-
-Workers get Kubernetes packages installed, but are **not** auto-joined. On the master:
-
-```bash
-# From your laptop (uses Terraform output helper)
-eval "$(terraform output -raw kubeadm_join_command)"
-
-# Or SSH in and print it yourself
-sudo kubeadm token create --print-join-command
-```
-
-Then run the printed `kubeadm join ...` command on each worker (with `sudo`).
 
 ## Access the cluster
 
 ```bash
-ssh USER@MASTER_PUBLIC_IP
+# Jumpbox
+eval "$(terraform output -raw ssh_command_jumpbox)"
+
+# Master via ProxyJump
+eval "$(terraform output -raw ssh_command_master)"
 kubectl get nodes
 kubectl get pods -A
 ```
 
+Optional local kubectl (API tunnel through the jumpbox):
+
+```bash
+# Terminal 1
+eval "$(terraform output -raw kubectl_tunnel_command)"
+
+# Terminal 2 — copy kubeconfig from master, set server to https://127.0.0.1:6443
+scp -o ProxyJump=ubuntu@JUMPBOX_IP ubuntu@MASTER_PRIVATE_IP:~/.kube/config ./kubeconfig
+# edit server: https://127.0.0.1:6443
+export KUBECONFIG=./kubeconfig
+kubectl get nodes
+```
+
 `master-init.sh` copies kubeconfig for both `root` and the configured `ssh_user`.
 
-The master's public IP is added as an API server cert SAN so `kubectl` / API access via the static IP works.
+## Join workers
+
+Workers get Kubernetes packages installed, but are **not** auto-joined:
+
+```bash
+eval "$(terraform output -raw kubeadm_join_command)"
+```
+
+Then SSH to each worker via the jumpbox and run the printed `kubeadm join ...` (with `sudo`):
+
+```bash
+ssh -J ubuntu@JUMPBOX_IP ubuntu@WORKER_PRIVATE_IP
+```
+
+## Deploy a secured sample app
+
+```bash
+# On the master (via ProxyJump)
+cd examples/hello-secure   # or scp this folder to the master
+chmod +x create-tls-secret.sh
+./create-tls-secret.sh
+kubectl apply -f hello.yaml
+
+# Hit the worker public IP (Ingress matches Host: hello.local)
+WORKER_IP=$(terraform -chdir=environment/staging output -json worker_public_ips | jq -r '.[0]')
+curl -H "Host: hello.local" "http://${WORKER_IP}/"
+curl -k -H "Host: hello.local" "https://${WORKER_IP}/"
+```
+
+If ingress-nginx was not installed at cluster create time (existing cluster), run on the master:
+
+```bash
+sudo bash /tmp/install-ingress.sh
+# or copy module/scripts/install-ingress.sh to the master and run it
+```
 
 ## Module inputs (common)
 
@@ -101,8 +160,9 @@ The master's public IP is added as an API server cert SAN so `kubectl` / API acc
 | `cluster_name` | `k8s` | Prefix for all resources |
 | `worker_count` | `1` | Number of worker VMs |
 | `instance_type` | `e2-medium` | Master + workers |
-| `use_spot_instances` | `true` | Cheaper; may be preempted |
-| `my_ip` | `0.0.0.0/0` | Restrict SSH to `YOUR_IP/32` |
+| `use_spot_instances` | `true` | Master/workers only; jumpbox is always on-demand |
+| `jumpbox_instance_type` | `e2-micro` | Bastion size |
+| `my_ip` | `0.0.0.0/0` | Restricts jumpbox SSH; use `YOUR_IP/32` |
 | `ssh_user` | `ubuntu` | Must match your SSH key username |
 | `ssh_public_key_path` / `ssh_private_key_path` | `~/.ssh/id_rsa(.pub)` | Used by provisioners |
 
@@ -117,8 +177,10 @@ terraform destroy
 
 ## Notes / caveats
 
-- Lab-oriented: API (`6443`) and NodePort ranges are open to the internet. Tighten firewalls before anything non-lab.
+- After apply, SSH directly to master/worker public IPs will fail — use the jumpbox (`ProxyJump`).
+- Public edge is HTTP/HTTPS on workers; API (`6443`) is VPC-only.
 - Prefer setting `my_ip` to your public IP `/32` instead of `0.0.0.0/0`.
-- Spot VMs can disappear; do not rely on this for durable state.
+- Sample TLS is self-signed (lab). For real certs, add cert-manager + a DNS name pointing at a worker IP (or a load balancer).
+- Spot VMs can disappear; do not rely on this for durable state. The jumpbox is on-demand on purpose.
 - `*.tfvars`, `.terraform/`, and `*.tfstate*` are gitignored — keep secrets and state local (or use a remote backend if you add one).
-- Kubernetes / CRI-O versions are pinned in `install-k8s-deps.sh` (currently `1.32`); Calico version is pinned in `master-init.sh`.
+- Kubernetes / CRI-O versions are pinned in `install-k8s-deps.sh` (currently `1.32`); Calico and ingress-nginx versions are pinned in the install scripts.

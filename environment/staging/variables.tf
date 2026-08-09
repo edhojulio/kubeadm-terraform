@@ -39,6 +39,16 @@ variable "use_spot_instances" {
   type = bool
 }
 
+variable "jumpbox_instance_type" {
+  type    = string
+  default = "e2-micro"
+}
+
+variable "jumpbox_boot_disk_size" {
+  type    = number
+  default = 10
+}
+
 variable "subnet_cidr" {
   type = string
 }

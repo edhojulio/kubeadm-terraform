@@ -13,14 +13,17 @@ cluster_name = "k8s"
 worker_count = 2
 
 # Compute Configuration
-instance_type      = "e2-medium"
-boot_disk_size     = 30
-boot_disk_image    = "ubuntu-os-cloud/ubuntu-2204-lts"
-use_spot_instances = true
+instance_type          = "e2-medium"
+boot_disk_size         = 30
+boot_disk_image        = "ubuntu-os-cloud/ubuntu-2204-lts"
+use_spot_instances     = true
+jumpbox_instance_type  = "e2-micro"
+jumpbox_boot_disk_size = 10
 
 # Network Configuration
 subnet_cidr = "10.10.1.0/24"
-my_ip       = "0.0.0.0/0"  # Change to "YOUR_IP/32" for production
+# Restricts SSH to the jumpbox only. Prefer YOUR_PUBLIC_IP/32.
+my_ip = "0.0.0.0/0"
 
 # SSH Configuration
 ssh_user             = "ubuntu"
