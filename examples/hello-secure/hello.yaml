@@ -1,9 +1,9 @@
 # Secure front-door example: ClusterIP Service + Ingress + NetworkPolicies.
 # Apply after ingress-nginx is installed (see module/scripts/install-ingress.sh).
 #
-# Access (use a worker public IP):
-#   curl -H "Host: hello.local" http://WORKER_PUBLIC_IP/
-#   curl -k -H "Host: hello.local" https://WORKER_PUBLIC_IP/
+# Hit the NLB VIP (Ingress matches Host: hello.local)
+# INGRESS_IP from: terraform output -raw ingress_public_ip
+#   curl -H "Host: hello.local" "http://${INGRESS_IP}/"
 ---
 apiVersion: v1
 kind: Namespace
