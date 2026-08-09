@@ -28,7 +28,7 @@ locals {
 
 # -----------------------------------------------------------------------------
 # NETWORKING
-# VPC, Subnet, and Static IP
+# VPC, Subnet, Cloud NAT (private node egress), jumpbox + ingress LB IPs
 # -----------------------------------------------------------------------------
 resource "google_compute_network" "k8s_vpc" {
   name                    = "${var.cluster_name}-vpc"
@@ -42,14 +42,36 @@ resource "google_compute_subnetwork" "k8s_subnet" {
   region        = var.gcp_region
 }
 
-resource "google_compute_address" "k8s_master_static_ip" {
-  name   = "${var.cluster_name}-master-static-ip"
-  region = var.gcp_region
-}
-
 resource "google_compute_address" "k8s_jumpbox_static_ip" {
   name   = "${var.cluster_name}-jumpbox-static-ip"
   region = var.gcp_region
+}
+
+# Public VIP for the external passthrough Network Load Balancer (app front door)
+resource "google_compute_address" "ingress_lb" {
+  count  = var.worker_count > 0 ? 1 : 0
+  name   = "${var.cluster_name}-ingress-lb-ip"
+  region = var.gcp_region
+}
+
+# Cloud Router + NAT so private master/workers can pull images and packages
+resource "google_compute_router" "nat" {
+  name    = "${var.cluster_name}-router"
+  region  = var.gcp_region
+  network = google_compute_network.k8s_vpc.id
+}
+
+resource "google_compute_router_nat" "nat" {
+  name                               = "${var.cluster_name}-nat"
+  router                             = google_compute_router.nat.name
+  region                             = var.gcp_region
+  nat_ip_allocate_option             = "AUTO_ONLY"
+  source_subnetwork_ip_ranges_to_nat = "ALL_SUBNETWORKS_ALL_IP_RANGES"
+
+  log_config {
+    enable = false
+    filter = "ERRORS_ONLY"
+  }
 }
 
 # -----------------------------------------------------------------------------
@@ -97,7 +119,7 @@ resource "google_compute_firewall" "allow_k8s_api" {
   target_tags   = ["${var.cluster_name}-master"]
 }
 
-# Public HTTP/HTTPS front door for ingress-nginx (hostNetwork on workers)
+# App traffic to workers (NLB passthrough preserves client source IPs)
 resource "google_compute_firewall" "allow_http_https" {
   name    = "${var.cluster_name}-vpc-allow-http-https"
   network = google_compute_network.k8s_vpc.name
@@ -109,6 +131,90 @@ resource "google_compute_firewall" "allow_http_https" {
 
   source_ranges = ["0.0.0.0/0"]
   target_tags   = ["${var.cluster_name}-worker"]
+}
+
+# GCP load balancer health checks
+resource "google_compute_firewall" "allow_lb_health_checks" {
+  name    = "${var.cluster_name}-vpc-allow-lb-health"
+  network = google_compute_network.k8s_vpc.name
+
+  allow {
+    protocol = "tcp"
+    ports    = ["80", "443"]
+  }
+
+  source_ranges = [
+    "130.211.0.0/22",
+    "35.191.0.0/16",
+  ]
+  target_tags = ["${var.cluster_name}-worker"]
+}
+
+# -----------------------------------------------------------------------------
+# INGRESS LOAD BALANCER
+# External passthrough NLB → private workers (ingress-nginx hostNetwork)
+# -----------------------------------------------------------------------------
+resource "google_compute_instance_group" "workers" {
+  count = var.worker_count > 0 ? 1 : 0
+
+  name      = "${var.cluster_name}-workers"
+  zone      = var.gcp_zone
+  instances = google_compute_instance.k8s_worker[*].self_link
+
+  named_port {
+    name = "http"
+    port = 80
+  }
+
+  named_port {
+    name = "https"
+    port = 443
+  }
+
+  depends_on = [google_compute_instance.k8s_worker]
+}
+
+resource "google_compute_region_health_check" "ingress" {
+  count = var.worker_count > 0 ? 1 : 0
+
+  name   = "${var.cluster_name}-ingress-hc"
+  region = var.gcp_region
+
+  timeout_sec        = 5
+  check_interval_sec = 10
+
+  tcp_health_check {
+    port = 80
+  }
+}
+
+resource "google_compute_region_backend_service" "ingress" {
+  count = var.worker_count > 0 ? 1 : 0
+
+  name                  = "${var.cluster_name}-ingress"
+  region                = var.gcp_region
+  protocol              = "TCP"
+  load_balancing_scheme = "EXTERNAL"
+  health_checks         = [google_compute_region_health_check.ingress[0].id]
+  timeout_sec           = 30
+
+  backend {
+    group          = google_compute_instance_group.workers[0].id
+    balancing_mode = "CONNECTION"
+  }
+}
+
+resource "google_compute_forwarding_rule" "ingress" {
+  count = var.worker_count > 0 ? 1 : 0
+
+  name                  = "${var.cluster_name}-ingress"
+  region                = var.gcp_region
+  ip_protocol           = "TCP"
+  load_balancing_scheme = "EXTERNAL"
+  ports                 = ["80", "443"]
+  ip_address            = google_compute_address.ingress_lb[0].address
+  backend_service       = google_compute_region_backend_service.ingress[0].id
+  network_tier          = "PREMIUM"
 }
 
 # -----------------------------------------------------------------------------
@@ -151,7 +257,7 @@ resource "google_compute_instance" "k8s_jumpbox" {
 }
 
 # -----------------------------------------------------------------------------
-# COMPUTE - MASTER NODE
+# COMPUTE - MASTER NODE (private, no public IP)
 # -----------------------------------------------------------------------------
 resource "google_compute_instance" "k8s_master" {
   name         = "${var.cluster_name}-master"
@@ -169,9 +275,7 @@ resource "google_compute_instance" "k8s_master" {
   network_interface {
     network    = google_compute_network.k8s_vpc.id
     subnetwork = google_compute_subnetwork.k8s_subnet.id
-    access_config {
-      nat_ip = google_compute_address.k8s_master_static_ip.address
-    }
+    # No access_config → no public IP (egress via Cloud NAT)
   }
 
   metadata = {
@@ -214,24 +318,25 @@ resource "google_compute_instance" "k8s_master" {
     destination = "/tmp/install-ingress.sh"
   }
 
-  # Execute the master init script
+  # Execute the master init script (private cluster — no public API SAN)
   provisioner "remote-exec" {
     inline = [
       "sudo chmod +x /tmp/install-k8s-deps.sh",
       "sudo chmod +x /tmp/master-init.sh",
       "sudo chmod +x /tmp/install-ingress.sh",
-      "sudo /tmp/master-init.sh ${var.ssh_user} ${google_compute_address.k8s_master_static_ip.address}"
+      "sudo /tmp/master-init.sh ${var.ssh_user}"
     ]
   }
 
   depends_on = [
     google_compute_instance.k8s_jumpbox,
     google_compute_firewall.allow_internal,
+    google_compute_router_nat.nat,
   ]
 }
 
 # -----------------------------------------------------------------------------
-# COMPUTE - WORKER NODES
+# COMPUTE - WORKER NODES (private, no public IP)
 # Uses count for dynamic scaling
 # -----------------------------------------------------------------------------
 resource "google_compute_instance" "k8s_worker" {
@@ -252,7 +357,7 @@ resource "google_compute_instance" "k8s_worker" {
   network_interface {
     network    = google_compute_network.k8s_vpc.id
     subnetwork = google_compute_subnetwork.k8s_subnet.id
-    access_config {}
+    # No access_config → no public IP (egress via Cloud NAT)
   }
 
   metadata = {
@@ -294,5 +399,6 @@ resource "google_compute_instance" "k8s_worker" {
   depends_on = [
     google_compute_instance.k8s_master,
     google_compute_instance.k8s_jumpbox,
+    google_compute_router_nat.nat,
   ]
 }

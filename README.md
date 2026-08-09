@@ -2,14 +2,14 @@
 
 Provision a small Kubernetes cluster on GCP with Terraform + kubeadm.
 
-This lab spins up a jumpbox (bastion), a control-plane (master), and optional worker VMs. It installs CRI-O / kubeadm / kubelet, initializes the cluster, and installs Calico, Metrics Server, and ingress-nginx (HTTP/HTTPS front door).
+This lab spins up a jumpbox (bastion), a **private** control-plane (master), and **private** worker VMs. It installs CRI-O / kubeadm / kubelet, initializes the cluster, and installs Calico, Metrics Server, and ingress-nginx. Public app traffic enters via an external Network Load Balancer VIP.
 
 ## Layout
 
 ```text
 .
 ├── module/                     # Reusable Terraform module
-│   ├── main.tf                 # VPC, firewall, jumpbox, master + workers
+│   ├── main.tf                 # VPC, NAT, firewall, jumpbox, LB, master + workers
 │   ├── variables.tf
 │   ├── outputs.tf
 │   ├── provider.tf
@@ -29,11 +29,12 @@ This lab spins up a jumpbox (bastion), a control-plane (master), and optional wo
 | Resource | Details |
 |---|---|
 | VPC + subnet | Custom network, default `10.10.1.0/24` |
-| Jumpbox | Small on-demand bastion with public IP (admin entry) |
-| Static IPs | Jumpbox + master |
-| Master VM | kubeadm init, Calico CNI, Metrics Server, ingress-nginx |
-| Worker VMs | deps installed; join manually |
-| Firewall | SSH to jumpbox from `my_ip`; SSH/API private (VPC); HTTP/HTTPS on workers |
+| Cloud NAT | Egress for private master/workers (image pulls, packages) |
+| Jumpbox | On-demand bastion — **only** admin host with a public IP |
+| Master VM | **Private only**; kubeadm init, Calico, Metrics Server, ingress-nginx |
+| Worker VMs | **Private only**; deps installed; join manually |
+| Ingress NLB | External passthrough LB VIP on `:80`/`:443` → workers |
+| Firewall | SSH to jumpbox from `my_ip`; SSH/API VPC-only; HTTP/HTTPS + LB health to workers |
 
 Defaults use **spot/preemptible** `e2-medium` Ubuntu 22.04 for master/workers. The jumpbox is always **on-demand** (`e2-micro` by default).
 
@@ -42,15 +43,17 @@ Defaults use **spot/preemptible** `e2-medium` Ubuntu 22.04 for master/workers. T
 ```text
 Laptop ──SSH──► jumpbox (public :22, my_ip only)
                   │
-                  ├──SSH──► master / workers (private IPs)
+                  ├──SSH──► master / workers (private IPs, no public IPs)
                   └──kubectl──► API :6443 (VPC only)
 
-Internet ──:80/:443──► worker (ingress-nginx hostNetwork)
-                         └──► ClusterIP Service ──► Pods
+Internet ──:80/:443──► Network Load Balancer VIP
+                         └──► private workers (ingress-nginx hostNetwork)
+                                └──► ClusterIP Service ──► Pods
 ```
 
-- Admin path: laptop → jumpbox → cluster (no public SSH/API on nodes).
-- App path: public HTTP/HTTPS on workers only.
+- Admin path: laptop → jumpbox → private cluster.
+- App path: internet → NLB VIP → private workers (not node public IPs).
+- Master/workers use Cloud NAT for outbound internet.
 - Do **not** expose apps with public NodePort.
 
 ## Prerequisites
@@ -85,7 +88,7 @@ Useful outputs after apply:
 terraform output ssh_command_jumpbox
 terraform output ssh_command_master
 terraform output kubectl_tunnel_command
-terraform output worker_public_ips
+terraform output ingress_public_ip
 terraform output kubeadm_join_command
 ```
 
@@ -139,10 +142,10 @@ chmod +x create-tls-secret.sh
 ./create-tls-secret.sh
 kubectl apply -f hello.yaml
 
-# Hit the worker public IP (Ingress matches Host: hello.local)
-WORKER_IP=$(terraform -chdir=environment/staging output -json worker_public_ips | jq -r '.[0]')
-curl -H "Host: hello.local" "http://${WORKER_IP}/"
-curl -k -H "Host: hello.local" "https://${WORKER_IP}/"
+# Hit the NLB VIP (Ingress matches Host: hello.local)
+INGRESS_IP=$(terraform -chdir=environment/staging output -raw ingress_public_ip)
+curl -H "Host: hello.local" "http://${INGRESS_IP}/"
+curl -k -H "Host: hello.local" "https://${INGRESS_IP}/"
 ```
 
 If ingress-nginx was not installed at cluster create time (existing cluster), run on the master:
@@ -177,10 +180,10 @@ terraform destroy
 
 ## Notes / caveats
 
-- After apply, SSH directly to master/worker public IPs will fail — use the jumpbox (`ProxyJump`).
-- Public edge is HTTP/HTTPS on workers; API (`6443`) is VPC-only.
+- Master and workers have **no public IPs**. Only the jumpbox (SSH) and the ingress NLB VIP (HTTP/HTTPS) are public.
+- Removing public IPs from an existing cluster **recreates** master/worker VMs (cluster re-init required).
 - Prefer setting `my_ip` to your public IP `/32` instead of `0.0.0.0/0`.
-- Sample TLS is self-signed (lab). For real certs, add cert-manager + a DNS name pointing at a worker IP (or a load balancer).
+- Sample TLS is self-signed (lab). For real certs, add cert-manager + DNS pointing at `ingress_public_ip`.
 - Spot VMs can disappear; do not rely on this for durable state. The jumpbox is on-demand on purpose.
 - `*.tfvars`, `.terraform/`, and `*.tfstate*` are gitignored — keep secrets and state local (or use a remote backend if you add one).
 - Kubernetes / CRI-O versions are pinned in `install-k8s-deps.sh` (currently `1.32`); Calico and ingress-nginx versions are pinned in the install scripts.

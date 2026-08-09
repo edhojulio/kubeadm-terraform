@@ -13,24 +13,19 @@ output "jumpbox_private_ip" {
   value       = module.kubeadm_cluster.jumpbox_private_ip
 }
 
-output "master_public_ip" {
-  description = "Public IP of the master node"
-  value       = module.kubeadm_cluster.master_public_ip
-}
-
 output "master_private_ip" {
-  description = "Private IP of the master node"
+  description = "Private IP of the master node (no public IP)"
   value       = module.kubeadm_cluster.master_private_ip
 }
 
-output "worker_public_ips" {
-  description = "Public IPs of all worker nodes"
-  value       = module.kubeadm_cluster.worker_public_ips
+output "worker_private_ips" {
+  description = "Private IPs of all worker nodes (no public IPs)"
+  value       = module.kubeadm_cluster.worker_private_ips
 }
 
-output "worker_private_ips" {
-  description = "Private IPs of all worker nodes"
-  value       = module.kubeadm_cluster.worker_private_ips
+output "ingress_public_ip" {
+  description = "Public VIP for HTTP/HTTPS (Network Load Balancer)"
+  value       = module.kubeadm_cluster.ingress_public_ip
 }
 
 output "ssh_command_jumpbox" {
