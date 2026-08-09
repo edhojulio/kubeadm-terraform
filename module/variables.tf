@@ -56,9 +56,21 @@ variable "boot_disk_image" {
 }
 
 variable "use_spot_instances" {
-  description = "Whether to use spot/preemptible instances (cheaper but can be terminated)."
+  description = "Whether to use spot/preemptible instances for master/workers (cheaper but can be terminated). Jumpbox is always on-demand."
   type        = bool
   default     = true
+}
+
+variable "jumpbox_instance_type" {
+  description = "Machine type for the jumpbox/bastion host (always on-demand)."
+  type        = string
+  default     = "e2-micro"
+}
+
+variable "jumpbox_boot_disk_size" {
+  description = "Boot disk size in GB for the jumpbox."
+  type        = number
+  default     = 10
 }
 
 # -----------------------------------------------------------------------------
@@ -71,9 +83,9 @@ variable "subnet_cidr" {
 }
 
 variable "my_ip" {
-  description = "Your public IP address to allow SSH access. Use x.x.x.x/32 for a single IP."
+  description = "CIDR allowed to SSH to the jumpbox (:22). Use YOUR_PUBLIC_IP/32. Cluster SSH/API stay private (VPC-only)."
   type        = string
-  default     = "0.0.0.0/0" # WARNING: This allows SSH from anywhere. For production, change to your IP.
+  default     = "0.0.0.0/0" # WARNING: opens jumpbox SSH to the world. Prefer YOUR_IP/32.
 }
 
 # -----------------------------------------------------------------------------

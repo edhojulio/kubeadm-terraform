@@ -31,10 +31,12 @@ module "kubeadm_cluster" {
   worker_count = var.worker_count
 
   # Compute Configuration
-  instance_type      = var.instance_type
-  boot_disk_size     = var.boot_disk_size
-  boot_disk_image    = var.boot_disk_image
-  use_spot_instances = var.use_spot_instances
+  instance_type          = var.instance_type
+  boot_disk_size         = var.boot_disk_size
+  boot_disk_image        = var.boot_disk_image
+  use_spot_instances     = var.use_spot_instances
+  jumpbox_instance_type  = var.jumpbox_instance_type
+  jumpbox_boot_disk_size = var.jumpbox_boot_disk_size
 
   # Network Configuration
   subnet_cidr = var.subnet_cidr

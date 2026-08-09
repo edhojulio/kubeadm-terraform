@@ -47,13 +47,18 @@ resource "google_compute_address" "k8s_master_static_ip" {
   region = var.gcp_region
 }
 
+resource "google_compute_address" "k8s_jumpbox_static_ip" {
+  name   = "${var.cluster_name}-jumpbox-static-ip"
+  region = var.gcp_region
+}
+
 # -----------------------------------------------------------------------------
 # SECURITY (FIREWALL RULES)
 # -----------------------------------------------------------------------------
 
-# Allow SSH from specified IP range
-resource "google_compute_firewall" "allow_ssh" {
-  name    = "${var.cluster_name}-vpc-allow-ssh"
+# Public SSH only to the jumpbox
+resource "google_compute_firewall" "allow_ssh_jumpbox" {
+  name    = "${var.cluster_name}-vpc-allow-ssh-jumpbox"
   network = google_compute_network.k8s_vpc.name
 
   allow {
@@ -62,10 +67,11 @@ resource "google_compute_firewall" "allow_ssh" {
   }
 
   source_ranges = [var.my_ip]
-  target_tags   = local.common_tags
+  target_tags   = ["${var.cluster_name}-jumpbox"]
 }
 
 # Allow all internal traffic between nodes within the VPC
+# (covers jumpbox → master/worker SSH and kubectl → API :6443)
 resource "google_compute_firewall" "allow_internal" {
   name    = "${var.cluster_name}-vpc-allow-internal"
   network = google_compute_network.k8s_vpc.name
@@ -77,7 +83,7 @@ resource "google_compute_firewall" "allow_internal" {
   source_ranges = [google_compute_subnetwork.k8s_subnet.ip_cidr_range]
 }
 
-# Allow traffic to the Kubernetes API server
+# Explicit VPC-only Kubernetes API rule (also covered by allow_internal)
 resource "google_compute_firewall" "allow_k8s_api" {
   name    = "${var.cluster_name}-vpc-allow-k8s-api"
   network = google_compute_network.k8s_vpc.name
@@ -87,22 +93,61 @@ resource "google_compute_firewall" "allow_k8s_api" {
     ports    = ["6443"]
   }
 
-  source_ranges = ["0.0.0.0/0"]
+  source_ranges = [google_compute_subnetwork.k8s_subnet.ip_cidr_range]
   target_tags   = ["${var.cluster_name}-master"]
 }
 
-# Allow traffic for NodePort services
-resource "google_compute_firewall" "allow_nodeport" {
-  name    = "${var.cluster_name}-vpc-allow-nodeport"
+# Public HTTP/HTTPS front door for ingress-nginx (hostNetwork on workers)
+resource "google_compute_firewall" "allow_http_https" {
+  name    = "${var.cluster_name}-vpc-allow-http-https"
   network = google_compute_network.k8s_vpc.name
 
   allow {
     protocol = "tcp"
-    ports    = ["30000-32767"]
+    ports    = ["80", "443"]
   }
 
   source_ranges = ["0.0.0.0/0"]
   target_tags   = ["${var.cluster_name}-worker"]
+}
+
+# -----------------------------------------------------------------------------
+# COMPUTE - JUMPBOX (bastion)
+# Always on-demand so admin access is not reclaimed with spot nodes.
+# -----------------------------------------------------------------------------
+resource "google_compute_instance" "k8s_jumpbox" {
+  name         = "${var.cluster_name}-jumpbox"
+  machine_type = var.jumpbox_instance_type
+  zone         = var.gcp_zone
+  tags         = ["${var.cluster_name}-jumpbox"]
+
+  boot_disk {
+    initialize_params {
+      image = var.boot_disk_image
+      size  = var.jumpbox_boot_disk_size
+    }
+  }
+
+  network_interface {
+    network    = google_compute_network.k8s_vpc.id
+    subnetwork = google_compute_subnetwork.k8s_subnet.id
+    access_config {
+      nat_ip = google_compute_address.k8s_jumpbox_static_ip.address
+    }
+  }
+
+  metadata = {
+    ssh-keys = "${var.ssh_user}:${local.ssh_public_key}"
+  }
+
+  scheduling {
+    automatic_restart   = true
+    preemptible         = false
+    provisioning_model  = "STANDARD"
+    on_host_maintenance = "MIGRATE"
+  }
+
+  depends_on = [google_compute_firewall.allow_ssh_jumpbox]
 }
 
 # -----------------------------------------------------------------------------
@@ -142,10 +187,13 @@ resource "google_compute_instance" "k8s_master" {
   }
 
   connection {
-    type        = "ssh"
-    user        = var.ssh_user
-    private_key = local.ssh_private_key
-    host        = self.network_interface[0].access_config[0].nat_ip
+    type                = "ssh"
+    user                = var.ssh_user
+    private_key         = local.ssh_private_key
+    host                = self.network_interface[0].network_ip
+    bastion_host        = google_compute_instance.k8s_jumpbox.network_interface[0].access_config[0].nat_ip
+    bastion_user        = var.ssh_user
+    bastion_private_key = local.ssh_private_key
   }
 
   # Copy the dependency script to the VM
@@ -160,16 +208,26 @@ resource "google_compute_instance" "k8s_master" {
     destination = "/tmp/master-init.sh"
   }
 
+  # Copy the ingress install script to the VM
+  provisioner "file" {
+    source      = "${path.module}/scripts/install-ingress.sh"
+    destination = "/tmp/install-ingress.sh"
+  }
+
   # Execute the master init script
   provisioner "remote-exec" {
     inline = [
       "sudo chmod +x /tmp/install-k8s-deps.sh",
       "sudo chmod +x /tmp/master-init.sh",
+      "sudo chmod +x /tmp/install-ingress.sh",
       "sudo /tmp/master-init.sh ${var.ssh_user} ${google_compute_address.k8s_master_static_ip.address}"
     ]
   }
 
-  depends_on = [google_compute_firewall.allow_ssh]
+  depends_on = [
+    google_compute_instance.k8s_jumpbox,
+    google_compute_firewall.allow_internal,
+  ]
 }
 
 # -----------------------------------------------------------------------------
@@ -210,10 +268,13 @@ resource "google_compute_instance" "k8s_worker" {
   }
 
   connection {
-    type        = "ssh"
-    user        = var.ssh_user
-    private_key = local.ssh_private_key
-    host        = self.network_interface[0].access_config[0].nat_ip
+    type                = "ssh"
+    user                = var.ssh_user
+    private_key         = local.ssh_private_key
+    host                = self.network_interface[0].network_ip
+    bastion_host        = google_compute_instance.k8s_jumpbox.network_interface[0].access_config[0].nat_ip
+    bastion_user        = var.ssh_user
+    bastion_private_key = local.ssh_private_key
   }
 
   # Copy the dependency script to the VM
@@ -230,5 +291,8 @@ resource "google_compute_instance" "k8s_worker" {
     ]
   }
 
-  depends_on = [google_compute_instance.k8s_master]
+  depends_on = [
+    google_compute_instance.k8s_master,
+    google_compute_instance.k8s_jumpbox,
+  ]
 }
